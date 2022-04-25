@@ -1,6 +1,6 @@
 #include <ACAN2517FD.h>
 #include <SPI.h>
-#include <cppQueue.h>
+#include <ArduinoQueue.h>
 #include <StateMachine.h>
 
 
@@ -14,15 +14,15 @@ const uint32_t inArbitrationBitRate = 500UL * 1000UL; // 500 Kbps
 const DataBitRateFactor inDataBitRateFactor = DataBitRateFactor::x4; // 500 Kbps * 4 = 2Mbps
 const uint32_t FrameID_Request  = 0x7C3;
 const uint32_t FrameID_Response = 0x7C9;
-const uint8_t TesterPresent[2] = { 0x3E, 0x00 };
 const uint32_t TesterPresent_Timer = 10000;
 const uint32_t DiagTimeout = 3000;
 
-const uint8_t reqshort[2] = { 0x10, 0x03};
-const uint8_t reqlong[40] = { 0x2E, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+uint8_t TesterPresent[2] = { 0x3E, 0x00 };
+uint8_t reqshort[2] = { 0x10, 0x03};
+uint8_t reqlong[40] = { 0x2E, 0x10, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11,
+                        0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+                        0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25};
 
 // ACAN2517FD Driver object
 ACAN2517FD can (MCP2517_CS, SPI, MCP2517_INT) ;
@@ -36,7 +36,7 @@ static bool bDiagLastResponsePositive;
 
 
 // Send a Diag Request, treating the 
-int SendDiagRequest(const uint8_t data[], const int data_size) {
+int SendDiagRequest(uint8_t data[], int data_size) {
     CANFDMessage frame ;
     bool ok = true ;
     frame.id = FrameID_Request ;
@@ -105,17 +105,19 @@ int SendDiagRequest(const uint8_t data[], const int data_size) {
             
         }
     }
-    if (ok) {
-        lastDiagRequest = data;
-        inDiagRequestSentTime = millis();
+    if (data != TesterPresent) {
+        if (ok) {
+            lastDiagRequest = data;
+            inDiagRequestSentTime = millis();
+        }
+        bDiagResponseReceived = false;
+        bDiagLastResponsePositive = false;
     }
-    bDiagResponseReceived = false;
-    bDiagLastResponsePositive = false;
     return ok;
 }
 
 void diagResponseReceived (const CANFDMessage & inMessage) {
-    Serial.print  ("Received Diag Response");
+    Serial.print  ("Received Diag Response ");
     Serial.print  (inMessage.id, HEX); 
     Serial.print  (" - "); 
     Serial.print  (inMessage.data[0], HEX);  Serial.print (" "); 
@@ -125,85 +127,74 @@ void diagResponseReceived (const CANFDMessage & inMessage) {
     Serial.print  (inMessage.data[4], HEX);  Serial.print (" "); 
     Serial.print  (inMessage.data[5], HEX);  Serial.print (" "); 
     Serial.print  (inMessage.data[6], HEX);  Serial.print (" "); 
-    Serial.println(inMessage.data[7], HEX); 
+    Serial.print(inMessage.data[7], HEX); 
     if (inMessage.data[1] == lastDiagRequest[0] + 0x40) {
+        Serial.println(". Positive response."); 
         bDiagResponseReceived = true;
         bDiagLastResponsePositive = true;
-        Serial.println("Positive response"); 
-    } else if (inMessage.data[1] == lastDiagRequest[0] + 0x50) {
+    } else if (inMessage.data[1] == 0x7F && inMessage.data[2] == lastDiagRequest[0]) {
+        Serial.println(". Negative response."); 
         bDiagResponseReceived = true;
         bDiagLastResponsePositive = false;
-        Serial.println("Negative response"); 
+    }
+    else {
+        Serial.println(". Not able to evaluate response.");
     }
 }
 
+typedef struct request {
+    long size;
+    uint8_t *data;
+} CANRequest;
+
+static ArduinoQueue<CANRequest> diagQueue(32);
 static bool CAN_OverallSuccess;
-static bool bEverStarted;
-static cppQueue diagQueue (sizeof(uint8_t **), 2, FIFO);
 StateMachine CAN_machine = StateMachine();
 
 void CAN_Idle(){
     Serial.println("CAN - Idle");
-    diagQueue.flush();
-    bEverStarted = false;
+    while (!diagQueue.isEmpty()) { 
+        diagQueue.dequeue(); 
+    }
 }
 
 void CAN_Prepare() {
     Serial.println("CAN - Preparing");
     if (CAN_machine.executeOnce) {
         CAN_OverallSuccess = true;
-        diagQueue.push(&reqshort);
-        diagQueue.push(&reqlong);
+        CANRequest req;
+        req.size = sizeof(reqshort);
+        req.data = reqshort;
+        diagQueue.enqueue(req);
+        CANRequest req2;
+        req2.size = sizeof(reqlong);
+        req2.data = reqlong;
+        diagQueue.enqueue(req2);
     }
 }
 
 void CAN_SendingReq() {
-    Serial.println("CAN - Sending Request");
     if (CAN_machine.executeOnce) {
-        uint8_t* data;
-        Serial.println("sending debug: ");
-        Serial.print ("ReqShort Address: ");
-        Serial.println((long) &reqshort, HEX);
-        bool ok = diagQueue.pop(&data);
-        Serial.print ("Data     Address: ");
-        Serial.println((long) (data), HEX);
-        Serial.print ("Data[0]: ");
-        Serial.println(data[0], HEX);
-        
-        Serial.println(ok);;
-        
-        Serial.println(diagQueue.getCount());
-        Serial.println(sizeof(*data));
-//        Serial.println((*data)[0], HEX);
-        CAN_OverallSuccess = CAN_OverallSuccess && SendDiagRequest(data, sizeof(data));
+        CANRequest req = diagQueue.dequeue();
+        CAN_OverallSuccess = CAN_OverallSuccess && SendDiagRequest(req.data, req.size);
     }
 }
 
 void CAN_AwaitingResp() {
-    Serial.println("CAN - Awaiting Response");
     if (millis() > inDiagRequestSentTime + DiagTimeout) {
-      CAN_OverallSuccess = false;
+        Serial.println("CAN - Timeout awaiting response");
+        CAN_OverallSuccess = false;
     }
 }
 
 bool CAN_IdleToPrepare() {
-    Serial.println("Idle to prepare.");    
+    //Serial.println("Idle to prepare.");
+    //TODO: Change this delay to some input 
     return true;
-     //    Serial.print("Sending Tester Present. gSendTesterPresentDate: ");
-    //    Serial.print(gSendTesterPresentDate);
-    //    Serial.print(". Millis: ");
-    //    Serial.println(millis());   
-    //if (millis() > 3000 && bEverStarted == false) {
-    //    Serial.println("Idle to prepare verification - OK");    
-    //    bEverStarted = true;
-    //    return true;
-    //}
-    //Serial.println("Idle to prepare verification - Not yet"); 
-    //return false;
 }
 
 bool CAN_PrepareToSending() {
-    Serial.println("Prepare to Sending");    
+    //Serial.println("Prepare to Sending");    
     return true;
 }
 
@@ -211,11 +202,29 @@ bool CAN_SendingToAwaitingResp() {
     return CAN_OverallSuccess;
 }
 
+bool CAN_AwaitingToSending() {
+    if (CAN_OverallSuccess && bDiagResponseReceived && bDiagLastResponsePositive && !diagQueue.isEmpty()) { 
+        return true; 
+    } else { 
+        return false; 
+    }
+}
+
+bool CAN_Finalizing() {
+    if (CAN_OverallSuccess && bDiagResponseReceived && bDiagLastResponsePositive && diagQueue.isEmpty()) {
+        Serial.println("Finished with success. Returning to Idle.");    
+        return true;
+    } else {
+        return false; 
+    }
+}
+
 bool CAN_Failure() {
     if (!CAN_OverallSuccess) {
         Serial.println("CAN Failure. Returning to Idle");
-        delay(5000);
+        return true;
     }
+    return false;
 }
 
 State* State_CAN_Idle = CAN_machine.addState(&CAN_Idle); 
@@ -242,14 +251,16 @@ int setup_CAN () {
     State_CAN_Idle->addTransition(&CAN_IdleToPrepare, State_CAN_Prepare);    
     State_CAN_Prepare->addTransition(&CAN_PrepareToSending, State_CAN_SendingReq); 
     State_CAN_SendingReq->addTransition(&CAN_SendingToAwaitingResp, State_CAN_AwaitingResp); 
+    State_CAN_AwaitingResp->addTransition(&CAN_AwaitingToSending, State_CAN_SendingReq);
+    State_CAN_AwaitingResp->addTransition(&CAN_Finalizing, State_CAN_Idle);  
     State_CAN_SendingReq->addTransition(&CAN_Failure, State_CAN_Idle);  
-    State_CAN_AwaitingResp->addTransition(&CAN_Failure, State_CAN_Idle);  
-
+    State_CAN_AwaitingResp->addTransition(&CAN_Failure, State_CAN_Idle);
+    
     // Begin SPI
     SPI.begin () ;
     //--- Configure ACAN2517FD
     Serial.print ("sizeof (ACAN2517FDSettings): ") ;
-    Serial.print (sizeof (ACAN2517FDSettings)) ;
+    Serial.print (sizeof (ACAN2517FDSettings), DEC) ;
     Serial.println (" bytes") ;
     Serial.println ("Configure ACAN2517FD") ;
     ACAN2517FDSettings settings (inOscillator, inArbitrationBitRate, inDataBitRateFactor) ;
@@ -308,16 +319,11 @@ void setup () {
 static uint32_t gSendTesterPresentDate = 0 ;
 
 void loop_CAN() {
-    //Send Tester Present
-    //    Serial.print("Sending Tester Present. gSendTesterPresentDate: ");
-    //    Serial.print(gSendTesterPresentDate);
-    //    Serial.print(". Millis: ");
-    //    Serial.println(millis());
- 
-    //if (gSendTesterPresentDate < millis ()) {
-    //    SendDiagRequest(TesterPresent, sizeof(TesterPresent));
-    //    gSendTesterPresentDate += TesterPresent_Timer;
-    //}
+    // Send Tester Present
+    if (TesterPresent_Timer > 0 && gSendTesterPresentDate < millis ()) {
+        SendDiagRequest(TesterPresent, sizeof(TesterPresent));
+        gSendTesterPresentDate += TesterPresent_Timer;
+    }
     can.dispatchReceivedMessage ();
     CAN_machine.run();
 }
@@ -325,5 +331,5 @@ void loop_CAN() {
 
 void loop () {
     loop_CAN();
-    delay(500);
+    delay(10);
 }
